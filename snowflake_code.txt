@@ -266,6 +266,286 @@ CALL get_row_count('YOUR_CONTROL_TABLE_NAME', 'YOUR_JOB_FREQUENCY');
 
 
 
+=======================
+Warehouse 
+=======================
+
+CREATE OR REPLACE PROCEDURE get_row_count(table_name VARCHAR, job_frequency VARCHAR)
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+DECLARE
+  create_format_sql STRING;
+  create_stage_sql STRING;
+  copy_into_sql STRING;
+  target_table_name STRING;
+  warehouse_name STRING;
+  res RESULTSET DEFAULT (
+    SELECT * 
+    FROM IDENTIFIER(:table_name)
+    WHERE job_frequency = :job_frequency
+  );
+  c1 CURSOR FOR res;
+  loaded_records NUMBER DEFAULT 0;
+  rejected_records NUMBER DEFAULT 0;
+  error_message STRING;
+BEGIN
+  FOR record IN c1 DO
+    target_table_name := record.TABLE_NAME;
+    warehouse_name := record.WAREHOUSE;
+    
+    -- Set the specific warehouse for the current table
+    EXECUTE IMMEDIATE 'USE WAREHOUSE ' || warehouse_name;
+
+    BEGIN
+      IF (record.FILE_TYPE = 'CSV') THEN
+          create_format_sql := 'CREATE OR REPLACE FILE FORMAT ' || record.FILE_FORMAT_NAME || 
+                       ' TYPE = ''' || record.FILE_TYPE || ''' ' ||
+                       ' SKIP_HEADER = ' || record.SKIP_HEADER ||
+                       ' FIELD_OPTIONALLY_ENCLOSED_BY = ''' || record.FIELD_OPTIONALLY_ENCLOSED_BY || ''';';   
+          INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:target_table_name, CURRENT_TIMESTAMP, :create_format_sql);
+          
+      ELSEIF (record.FILE_TYPE = 'PARQUET') THEN
+          create_format_sql := 'CREATE OR REPLACE FILE FORMAT ' || record.FILE_FORMAT_NAME ||
+                                  ' TYPE = ''' || record.FILE_TYPE || ''' ' ||
+                                   ' COMPRESSION = ''' || record.COMPRESSION || ''' ' ||
+                                   ' BINARY_AS_TEXT = ' || record.BINARY_AS_TEXT ||
+                                   ' USE_LOGICAL_TYPE = ' || record.USE_LOGICAL_TYPE ||
+                                   ' TRIM_SPACE = ' || record.TRIM_SPACE ||
+                                   ' REPLACE_INVALID_CHARACTERS = ' || record.REPLACE_INVALID_CHARACTERS ||
+                                   ' NULL_IF = ' || record.NULL_IF || ';';
+          INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:target_table_name, CURRENT_TIMESTAMP, :create_format_sql);
+          
+      ELSE
+          RETURN 'NO SPECIFIC FILES ARE UPLOADED';
+      END IF;
+
+      EXECUTE IMMEDIATE create_format_sql;
+
+    EXCEPTION
+      WHEN OTHERS THEN
+        error_message := 'Error creating file format: ' || SQLERRM;
+        INSERT INTO copy_command_audit (table_name, load_time, records_loaded, records_rejected, error_message)
+        VALUES (:target_table_name, CURRENT_TIMESTAMP, 0, 0, :error_message);
+        CONTINUE;
+    END;
+
+    BEGIN
+      create_stage_sql := 'CREATE OR REPLACE STAGE ' || record.STAGE_NAME ||
+                               ' URL = ''' || record.STORAGE_LOC || ''' ' ||
+                               ' STORAGE_INTEGRATION = ' || record.STORAGE_INT_NAME || ';';
+      INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:target_table_name, CURRENT_TIMESTAMP, :create_stage_sql); 
+      EXECUTE IMMEDIATE create_stage_sql;
+
+    EXCEPTION
+      WHEN OTHERS THEN
+        error_message := 'Error creating stage: ' || SQLERRM;
+        INSERT INTO copy_command_audit (table_name, load_time, records_loaded, records_rejected, error_message)
+        VALUES (:target_table_name, CURRENT_TIMESTAMP, 0, 0, :error_message);
+        CONTINUE;
+    END;
+
+    BEGIN
+      copy_into_sql := 'COPY INTO ' || record.TABLE_NAME ||
+                            ' FROM @' || record.STAGE_NAME ||
+                            ' FILE_FORMAT = (FORMAT_NAME = ' || record.FILE_FORMAT_NAME || ') ' ||
+                            ' ON_ERROR = ''' || record.ON_ERROR || ''' ' ||
+                            ' SIZE_LIMIT = ' || record.SIZE_LIMIT ||
+                            ' PURGE = ' || record.PURGE ||
+                            ' RETURN_FAILED_ONLY = ' || record.RETURN_FAILED_ONLY ||
+                            ' MATCH_BY_COLUMN_NAME = ''' || record.MATCH_BY_COLUMN_NAME || ''' ' ||
+                            ' INCLUDE_METADATA = ' || record.INCLUDE_METADATA || 
+                            ' ENFORCE_LENGTH = ' || record.ENFORCE_LENGTH ||
+                            ' TRUNCATECOLUMNS = ' || record.TRUNCATECOLUMNS ||
+                            ' FORCE = ' || record.FORCE ||
+                            ' LOAD_UNCERTAIN_FILES = ' || record.LOAD_UNCERTAIN_FILES || ';';
+
+      INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:target_table_name, CURRENT_TIMESTAMP, :copy_into_sql);
+      EXECUTE IMMEDIATE copy_into_sql;
+
+      -- Initialize default values
+      LET loaded_records := 0;
+      LET rejected_records := 0;
+      LET error_message := '';
+
+      -- Capture the results of the COPY INTO command with exception handling
+      BEGIN
+          FOR hist IN (SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))) DO
+              loaded_records := hist.ROWS_LOADED;
+              rejected_records := hist.ROWS_PARSED - hist.ROWS_LOADED;
+              error_message := COALESCE(hist.ERRORS, '');
+          END FOR;
+      EXCEPTION
+          WHEN OTHERS THEN
+              error_message := 'Error querying copy history: ' || SQLERRM;
+              -- Insert the error message into the audit table
+              INSERT INTO copy_command_audit (table_name, load_time, records_loaded, records_rejected, error_message)
+              VALUES (:target_table_name, CURRENT_TIMESTAMP, 0, 0, :error_message);
+              CONTINUE;
+      END;
+
+      -- Insert the results into the audit table
+      INSERT INTO copy_command_audit (table_name, load_time, records_loaded, records_rejected, error_message)
+      VALUES (:target_table_name, CURRENT_TIMESTAMP, :loaded_records, :rejected_records, :error_message);
+
+    EXCEPTION
+      WHEN OTHERS THEN
+          error_message := 'Error executing copy command: ' || SQLERRM;
+          -- Insert the error message into the audit table
+          INSERT INTO copy_command_audit (table_name, load_time, records_loaded, records_rejected, error_message)
+          VALUES (:target_table_name, CURRENT_TIMESTAMP, 0, 0, :error_message);
+    END;
+
+  END FOR;
+
+  RETURN 'Data load commands executed successfully';
+END;
+$$;
+
+
+
+
+
+
+==========================
+Warehouse + Batch
+==========================
+
+
+CREATE OR REPLACE PROCEDURE get_row_count(table_name VARCHAR, job_frequency VARCHAR, batch_number VARCHAR)
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+DECLARE
+  create_format_sql STRING;
+  create_stage_sql STRING;
+  copy_into_sql STRING;
+  target_table_name STRING;
+  warehouse_name STRING;
+  res RESULTSET DEFAULT (
+    SELECT * 
+    FROM IDENTIFIER(:table_name)
+    WHERE job_frequency = :job_frequency AND batch_number = :batch_number
+  );
+  c1 CURSOR FOR res;
+  loaded_records NUMBER DEFAULT 0;
+  rejected_records NUMBER DEFAULT 0;
+  error_message STRING;
+BEGIN
+  FOR record IN c1 DO
+    target_table_name := record.TABLE_NAME;
+    warehouse_name := record.WAREHOUSE;
+    
+    -- Set the specific warehouse for the current table
+    EXECUTE IMMEDIATE 'USE WAREHOUSE ' || warehouse_name;
+
+    BEGIN
+      IF (record.FILE_TYPE = 'CSV') THEN
+          create_format_sql := 'CREATE OR REPLACE FILE FORMAT ' || record.FILE_FORMAT_NAME || 
+                       ' TYPE = ''' || record.FILE_TYPE || ''' ' ||
+                       ' SKIP_HEADER = ' || record.SKIP_HEADER ||
+                       ' FIELD_OPTIONALLY_ENCLOSED_BY = ''' || record.FIELD_OPTIONALLY_ENCLOSED_BY || ''';';   
+          INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:target_table_name, CURRENT_TIMESTAMP, :create_format_sql);
+          
+      ELSEIF (record.FILE_TYPE = 'PARQUET') THEN
+          create_format_sql := 'CREATE OR REPLACE FILE FORMAT ' || record.FILE_FORMAT_NAME ||
+                                  ' TYPE = ''' || record.FILE_TYPE || ''' ' ||
+                                   ' COMPRESSION = ''' || record.COMPRESSION || ''' ' ||
+                                   ' BINARY_AS_TEXT = ' || record.BINARY_AS_TEXT ||
+                                   ' USE_LOGICAL_TYPE = ' || record.USE_LOGICAL_TYPE ||
+                                   ' TRIM_SPACE = ' || record.TRIM_SPACE ||
+                                   ' REPLACE_INVALID_CHARACTERS = ' || record.REPLACE_INVALID_CHARACTERS ||
+                                   ' NULL_IF = ' || record.NULL_IF || ';';
+          INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:target_table_name, CURRENT_TIMESTAMP, :create_format_sql);
+          
+      ELSE
+          RETURN 'NO SPECIFIC FILES ARE UPLOADED';
+      END IF;
+
+      EXECUTE IMMEDIATE create_format_sql;
+
+    EXCEPTION
+      WHEN OTHERS THEN
+        error_message := 'Error creating file format: ' || SQLERRM;
+        INSERT INTO copy_command_audit (table_name, load_time, records_loaded, records_rejected, error_message)
+        VALUES (:target_table_name, CURRENT_TIMESTAMP, 0, 0, :error_message);
+        CONTINUE;
+    END;
+
+    BEGIN
+      create_stage_sql := 'CREATE OR REPLACE STAGE ' || record.STAGE_NAME ||
+                               ' URL = ''' || record.STORAGE_LOC || ''' ' ||
+                               ' STORAGE_INTEGRATION = ' || record.STORAGE_INT_NAME || ';';
+      INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:target_table_name, CURRENT_TIMESTAMP, :create_stage_sql); 
+      EXECUTE IMMEDIATE create_stage_sql;
+
+    EXCEPTION
+      WHEN OTHERS THEN
+        error_message := 'Error creating stage: ' || SQLERRM;
+        INSERT INTO copy_command_audit (table_name, load_time, records_loaded, records_rejected, error_message)
+        VALUES (:target_table_name, CURRENT_TIMESTAMP, 0, 0, :error_message);
+        CONTINUE;
+    END;
+
+    BEGIN
+      copy_into_sql := 'COPY INTO ' || record.TABLE_NAME ||
+                            ' FROM @' || record.STAGE_NAME ||
+                            ' FILE_FORMAT = (FORMAT_NAME = ' || record.FILE_FORMAT_NAME || ') ' ||
+                            ' ON_ERROR = ''' || record.ON_ERROR || ''' ' ||
+                            ' SIZE_LIMIT = ' || record.SIZE_LIMIT ||
+                            ' PURGE = ' || record.PURGE ||
+                            ' RETURN_FAILED_ONLY = ' || record.RETURN_FAILED_ONLY ||
+                            ' MATCH_BY_COLUMN_NAME = ''' || record.MATCH_BY_COLUMN_NAME || ''' ' ||
+                            ' INCLUDE_METADATA = ' || record.INCLUDE_METADATA || 
+                            ' ENFORCE_LENGTH = ' || record.ENFORCE_LENGTH ||
+                            ' TRUNCATECOLUMNS = ' || record.TRUNCATECOLUMNS ||
+                            ' FORCE = ' || record.FORCE ||
+                            ' LOAD_UNCERTAIN_FILES = ' || record.LOAD_UNCERTAIN_FILES || ';';
+
+      INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:target_table_name, CURRENT_TIMESTAMP, :copy_into_sql);
+      EXECUTE IMMEDIATE copy_into_sql;
+
+      -- Initialize default values
+      LET loaded_records := 0;
+      LET rejected_records := 0;
+      LET error_message := '';
+
+      -- Capture the results of the COPY INTO command with exception handling
+      BEGIN
+          FOR hist IN (SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))) DO
+              loaded_records := hist.ROWS_LOADED;
+              rejected_records := hist.ROWS_PARSED - hist.ROWS_LOADED;
+              error_message := COALESCE(hist.ERRORS, '');
+          END FOR;
+      EXCEPTION
+          WHEN OTHERS THEN
+              error_message := 'Error querying copy history: ' || SQLERRM;
+              -- Insert the error message into the audit table
+              INSERT INTO copy_command_audit (table_name, load_time, records_loaded, records_rejected, error_message)
+              VALUES (:target_table_name, CURRENT_TIMESTAMP, 0, 0, :error_message);
+              CONTINUE;
+      END;
+
+      -- Insert the results into the audit table
+      INSERT INTO copy_command_audit (table_name, load_time, records_loaded, records_rejected, error_message)
+      VALUES (:target_table_name, CURRENT_TIMESTAMP, :loaded_records, :rejected_records, :error_message);
+
+    EXCEPTION
+      WHEN OTHERS THEN
+          error_message := 'Error executing copy command: ' || SQLERRM;
+          -- Insert the error message into the audit table
+          INSERT INTO copy_command_audit (table_name, load_time, records_loaded, records_rejected, error_message)
+          VALUES (:target_table_name, CURRENT_TIMESTAMP, 0, 0, :error_message);
+    END;
+
+  END FOR;
+
+  RETURN 'Data load commands executed successfully';
+END;
+$$;
+
 
 
 
