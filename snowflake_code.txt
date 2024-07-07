@@ -1104,3 +1104,247 @@ BEGIN
 END;
 $$;
 
+
+
+
+
+
+
+
+
+
+
+
+
+=============================
+Final version code - V1
+=============================
+
+CREATE OR REPLACE PROCEDURE s3_sf_data_load(table_name VARCHAR, job_frequency VARCHAR, batch_number VARCHAR)
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+DECLARE
+  create_format_sql STRING;
+  create_stage_sql STRING;
+  copy_into_sql STRING;
+  create_temp_table_sql STRING;
+  source_table_name STRING;
+  warehouse_name STRING;
+  transformation_sql STRING;
+  transformation_query STRING;
+  temp_table_name STRING;
+  temp_transformation_query STRING;
+  transformed_table_name STRING;
+  dependent_tables_loaded BOOLEAN;
+  OTHERS STRING;
+  res RESULTSET DEFAULT (
+    SELECT *
+    FROM IDENTIFIER(:table_name)
+    WHERE job_frequency = :job_frequency AND batch_number = :batch_number
+  );
+  c1 CURSOR FOR res;
+  loaded_records NUMBER DEFAULT 0;
+  rejected_records NUMBER DEFAULT 0;
+  error_message STRING;
+  last_execution_status STRING;
+BEGIN
+  
+  FOR record IN c1 DO
+    source_table_name := record.Source_TABLE_NAME;
+    warehouse_name := record.WAREHOUSE;
+    transformation_query := record.TRANSFORMATION_QUERY;
+    transformed_table_name := record.TRANSFORMED_TABLE_NAME;
+    temp_table_name := source_table_name || '_TEMP';
+
+    -- Check the status of the previous execution for the target table
+    BEGIN
+      SELECT status
+      INTO last_execution_status
+      FROM copy_command_audit
+      WHERE table_name = :source_table_name
+      ORDER BY load_time DESC
+      LIMIT 1;
+     
+      -- If the last execution was not successful, skip the current execution
+      IF (last_execution_status != 'SUCCESS') THEN
+        INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:source_table_name, CURRENT_TIMESTAMP, 'Previous load failed, skipping today''s execution');
+        CONTINUE;
+      END IF;
+    EXCEPTION
+      WHEN OTHERS THEN
+        -- If no previous load information is found, proceed with the execution
+        last_execution_status := 'NO_DATA';
+    END;
+
+    -- Set the specific warehouse for the current table
+    EXECUTE IMMEDIATE 'USE WAREHOUSE ' || warehouse_name;
+
+    BEGIN
+      IF (record.FILE_TYPE = 'CSV') THEN
+          create_format_sql := 'CREATE OR REPLACE FILE FORMAT ' || record.FILE_FORMAT_NAME ||
+                               ' TYPE = ''' || record.FILE_TYPE || ''' ' ||
+                               ' SKIP_HEADER = ' || record.SKIP_HEADER ||
+                               ' FIELD_OPTIONALLY_ENCLOSED_BY = ''' || record.FIELD_OPTIONALLY_ENCLOSED_BY || ''';';  
+          INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:source_table_name, CURRENT_TIMESTAMP, create_format_sql);
+         
+      ELSEIF (record.FILE_TYPE = 'PARQUET') THEN
+          create_format_sql := 'CREATE OR REPLACE FILE FORMAT ' || record.FILE_FORMAT_NAME ||
+                               ' TYPE = ''' || record.FILE_TYPE || ''' ' ||
+                               ' COMPRESSION = ''' || record.COMPRESSION || ''' ' ||
+                               ' BINARY_AS_TEXT = ' || record.BINARY_AS_TEXT ||
+                               ' USE_LOGICAL_TYPE = ' || record.USE_LOGICAL_TYPE ||
+                               ' TRIM_SPACE = ' || record.TRIM_SPACE ||
+                               ' REPLACE_INVALID_CHARACTERS = ' || record.REPLACE_INVALID_CHARACTERS ||
+                               ' NULL_IF = ' || record.NULL_IF || ';';
+          INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:source_table_name, CURRENT_TIMESTAMP, create_format_sql);
+         
+      ELSE
+          RETURN 'NO SPECIFIC FILES ARE UPLOADED';
+      END IF;
+
+      EXECUTE IMMEDIATE create_format_sql;
+
+    EXCEPTION
+      WHEN OTHERS THEN
+        error_message := 'Error creating file format: ' || SQLERRM;
+        INSERT INTO copy_command_audit (table_name, load_time, records_loaded, records_rejected, error_message, status)
+        VALUES (:source_table_name, CURRENT_TIMESTAMP, 0, 0, error_message, 'FAILURE');
+        CONTINUE;
+    END;
+
+    BEGIN
+      create_stage_sql := 'CREATE OR REPLACE STAGE ' || record.STAGE_NAME ||
+                          ' URL = ''' || record.STORAGE_LOC || ''' ' ||
+                          ' STORAGE_INTEGRATION = ' || record.STORAGE_INT_NAME || ';';
+      INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:source_table_name, CURRENT_TIMESTAMP, create_stage_sql);
+      EXECUTE IMMEDIATE create_stage_sql;
+
+    EXCEPTION
+      WHEN OTHERS THEN
+        error_message := 'Error creating stage: ' || SQLERRM;
+        INSERT INTO copy_command_audit (table_name, load_time, records_loaded, records_rejected, error_message, status)
+        VALUES (:source_table_name, CURRENT_TIMESTAMP, 0, 0, error_message, 'FAILURE');
+        CONTINUE;
+    END;
+
+    BEGIN
+      -- Create the temporary table based on the selected columns
+      create_temp_table_sql := 'CREATE OR REPLACE TEMP TABLE ' || temp_table_name || ' AS SELECT ' || record.SELECT_COLUMNS || ' FROM ' || source_table_name || ' LIMIT 0;';
+      EXECUTE IMMEDIATE create_temp_table_sql;
+      INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:source_table_name, CURRENT_TIMESTAMP, create_temp_table_sql);
+
+      -- Construct the COPY INTO command
+      copy_into_sql := 'COPY INTO ' || temp_table_name ||
+                       ' FROM (SELECT ' || record.SELECT_COLUMNS || 
+                       ' FROM @' || record.STAGE_NAME || ') ' ||
+                       ' FILE_FORMAT = (FORMAT_NAME = ' || record.FILE_FORMAT_NAME || ') ' ||
+                       ' ON_ERROR = ''' || record.ON_ERROR || ''' ' ||
+                       ' SIZE_LIMIT = ' || record.SIZE_LIMIT ||
+                       ' PURGE = ' || record.PURGE ||
+                       ' RETURN_FAILED_ONLY = ' || record.RETURN_FAILED_ONLY ||
+                       ' MATCH_BY_COLUMN_NAME = ''' || record.MATCH_BY_COLUMN_NAME || ''' ' ||
+                       ' INCLUDE_METADATA = ' || record.INCLUDE_METADATA ||
+                       ' ENFORCE_LENGTH = ' || record.ENFORCE_LENGTH ||
+                       ' TRUNCATECOLUMNS = ' || record.TRUNCATECOLUMNS ||
+                       ' FORCE = ' || record.FORCE ||
+                       ' LOAD_UNCERTAIN_FILES = ' || record.LOAD_UNCERTAIN_FILES || ';';
+
+      INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:source_table_name, CURRENT_TIMESTAMP, copy_into_sql);
+      EXECUTE IMMEDIATE copy_into_sql;
+
+      -- Initialize default values
+      loaded_records := 0;
+      rejected_records := 0;
+      error_message := '';
+
+      -- Capture the results of the COPY INTO command with exception handling
+      BEGIN
+          FOR hist IN (SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))) DO
+              loaded_records := hist.ROWS_LOADED;
+              rejected_records := hist.ROWS_PARSED - hist.ROWS_LOADED;
+              error_message := COALESCE(hist.ERRORS, '');
+          END FOR;
+      EXCEPTION
+          WHEN OTHERS THEN
+              error_message := 'Error querying copy history: ' || SQLERRM;
+              -- Insert the error message into the audit table
+              INSERT INTO copy_command_audit (table_name, load_time, records_loaded, records_rejected, error_message, status)
+              VALUES (:source_table_name, CURRENT_TIMESTAMP, 0, 0, error_message, 'FAILURE');
+              CONTINUE;
+      END;
+
+      -- Insert the results into the audit table
+      INSERT INTO copy_command_audit (table_name, load_time, records_loaded, records_rejected, error_message, status)
+      VALUES (:source_table_name, CURRENT_TIMESTAMP, loaded_records, rejected_records, error_message, 'SUCCESS');
+
+    EXCEPTION
+      WHEN OTHERS THEN
+          error_message := 'Error executing copy command: ' || SQLERRM;
+          -- Insert the error message into the audit table
+          INSERT INTO copy_command_audit (table_name, load_time, records_loaded, records_rejected, error_message, status)
+          VALUES (:source_table_name, CURRENT_TIMESTAMP, 0, 0, error_message, 'FAILURE');
+    END;
+
+    -- Ensure all dependent tables are loaded successfully before transformation
+    dependent_tables_loaded := TRUE;
+    FOR dep_table IN (
+      SELECT DISTINCT source_table_name
+      FROM IDENTIFIER(:table_name)
+      WHERE transformed_table_name = :transformed_table_name
+    ) DO
+      SELECT status
+      INTO last_execution_status
+      FROM copy_command_audit
+      WHERE table_name = dep_table.source_table_name
+      ORDER BY load_time DESC
+      LIMIT 1;
+
+      IF (last_execution_status != 'SUCCESS') THEN
+        dependent_tables_loaded := FALSE;
+        EXIT;
+      END IF;
+    END FOR;
+
+    IF (dependent_tables_loaded) THEN
+        -- Data Transformation Logic
+        -- Dynamically replace original table names with temporary table names in the transformation query
+      BEGIN
+         FOR tbl IN (SELECT table_name FROM information_schema.tables WHERE table_schema = 'YOUR_SCHEMA_NAME') DO
+            temp_transformation_query := REPLACE(transformation_query, tbl.table_name, tbl.table_name || '_TEMP');
+            transformation_query := temp_transformation_query; -- Update the transformation_query with the new value
+         END FOR;
+      END;
+
+      BEGIN 
+        transformation_sql := 'INSERT INTO ' || transformed_table_name || ' ' || transformation_query;
+        EXECUTE IMMEDIATE transformation_sql;
+        INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:transformed_table_name, CURRENT_TIMESTAMP, 'Transformation executed: ' || transformation_sql);
+      EXCEPTION
+        WHEN OTHERS THEN
+          error_message := 'Error executing transformation: ' || SQLERRM;
+          INSERT INTO copy_command_audit (table_name, load_time, records_loaded, records_rejected, error_message, status)
+          VALUES (:transformed_table_name, CURRENT_TIMESTAMP, 0, 0, error_message, 'FAILURE');
+      END;
+    ELSE
+      INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:transformed_table_name, CURRENT_TIMESTAMP, 'Dependent source tables not loaded successfully, skipping transformation');
+    END IF;
+  END FOR;
+  
+  -- Drop temporary tables
+  FOR temp_table IN (SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME LIKE '%_TEMP' AND TABLE_SCHEMA = 'YOUR_SCHEMA_NAME') DO
+    EXECUTE IMMEDIATE 'DROP TABLE ' || temp_table.TABLE_NAME;
+  END FOR;
+
+  RETURN 'Data load commands executed successfully';
+END;
+$$;
+
+
+
+
+
+CALL s3_sf_data_load('CONTROL_TABLE_NAME', 'daily', 'BATCH_1');
+
+
