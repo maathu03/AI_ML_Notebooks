@@ -1348,3 +1348,135 @@ $$;
 CALL s3_sf_data_load('CONTROL_TABLE_NAME', 'daily', 'BATCH_1');
 
 
+
+
+
+
+
+======================================
+External table working code- V1
+======================================
+
+
+CREATE OR REPLACE PROCEDURE s3_sf_data_load(table_name VARCHAR, job_frequency VARCHAR, batch_number VARCHAR)
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+DECLARE
+  create_format_sql STRING;
+  create_stage_sql STRING;
+  copy_into_sql STRING;
+  create_temp_table_sql STRING;
+  source_table_name STRING;
+  warehouse_name STRING;
+  external_table_name STRING;
+  error_message STRING;
+  create_external_tbl STRING;
+  
+  cur CURSOR FOR
+    SELECT * 
+    FROM CONTROL_TABLE_NAME 
+    WHERE job_frequency = 'daily'AND batch_number = 'BATCH_1';
+
+  loaded_records NUMBER DEFAULT 0;
+  rejected_records NUMBER DEFAULT 0;
+  last_execution_status STRING;
+
+BEGIN
+  FOR record IN cur DO
+    source_table_name := record.source_table_name;
+    external_table_name := source_table_name || '_ET';
+
+    BEGIN
+      IF (record.FILE_TYPE = 'CSV') THEN
+          create_format_sql := 'CREATE OR REPLACE FILE FORMAT ' || record.FILE_FORMAT_NAME ||
+                               ' TYPE = ''' || record.FILE_TYPE || ''' ' ||
+                               ' SKIP_HEADER = ' || record.SKIP_HEADER ||
+                               ' FIELD_OPTIONALLY_ENCLOSED_BY = ''' || record.FIELD_OPTIONALLY_ENCLOSED_BY || ''';';  
+          INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:source_table_name, CURRENT_TIMESTAMP, :create_format_sql);
+         
+      ELSEIF (record.FILE_TYPE = 'PARQUET') THEN
+          create_format_sql := 'CREATE OR REPLACE FILE FORMAT ' || record.FILE_FORMAT_NAME ||
+                               ' TYPE = ''' || record.FILE_TYPE || ''' ' ||
+                               ' COMPRESSION = ''' || record.COMPRESSION || ''' ' ||
+                               ' BINARY_AS_TEXT = ' || record.BINARY_AS_TEXT ||
+                               ' USE_LOGICAL_TYPE = ' || record.USE_LOGICAL_TYPE ||
+                               ' TRIM_SPACE = ' || record.TRIM_SPACE ||
+                               ' REPLACE_INVALID_CHARACTERS = ' || record.REPLACE_INVALID_CHARACTERS ||
+                               ' NULL_IF = ' || record.NULL_IF || ';';
+          INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:source_table_name, CURRENT_TIMESTAMP, :create_format_sql);
+         
+      ELSE
+          RETURN 'NO SPECIFIC FILES ARE UPLOADED';
+      END IF;
+      
+      EXECUTE IMMEDIATE create_format_sql;
+
+      INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:source_table_name, CURRENT_TIMESTAMP, 'Create format executed successfully');
+    EXCEPTION
+      WHEN OTHER THEN
+        error_message := 'Error creating file format: ' || SQLERRM;
+        INSERT INTO copy_command_audit (table_name, load_time, records_loaded, records_rejected, error_message, status)
+        VALUES (:source_table_name, CURRENT_TIMESTAMP, 0, 0, error_message, 'FAILURE');
+        CONTINUE;
+    END;
+
+    BEGIN
+      create_stage_sql := 'CREATE OR REPLACE STAGE ' || record.STAGE_NAME ||
+                          ' URL = ''' || record.STORAGE_LOC || ''' ' ||
+                          ' STORAGE_INTEGRATION = ' || record.STORAGE_INT_NAME || 
+                          ' FILE_FORMAT = (FORMAT_NAME = ' || record.FILE_FORMAT_NAME || ') ' ||  ';';
+                          
+      INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:source_table_name, CURRENT_TIMESTAMP, :create_stage_sql);
+      
+      EXECUTE IMMEDIATE create_stage_sql;
+      INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:source_table_name, CURRENT_TIMESTAMP, 'Create Stage executed Successfully');
+    EXCEPTION
+      WHEN OTHER THEN
+        error_message := 'Error creating stage: ' || SQLERRM;
+        INSERT INTO copy_command_audit (table_name, load_time, records_loaded, records_rejected, error_message, status)
+        VALUES (:source_table_name, CURRENT_TIMESTAMP, 0, 0, :error_message, 'FAILURE');
+        CONTINUE;
+    END;
+
+    BEGIN
+        
+        create_external_tbl := 'CREATE OR REPLACE EXTERNAL TABLE ' || external_table_name || ' ' ||
+                      'USING TEMPLATE (' ||
+                      'SELECT ARRAY_AGG(OBJECT_CONSTRUCT(' ||
+                      '''COLUMN_NAME'', COLUMN_NAME, ' ||
+                      '''TYPE'', TYPE, ' ||
+                      '''NULLABLE'', NULLABLE, ' ||
+                      '''EXPRESSION'', EXPRESSION)) ' ||
+                      ' FROM TABLE(' ||
+                      ' INFER_SCHEMA(' ||
+                      ' LOCATION => ''@' || record.STAGE_NAME || ''', ' ||
+                      ' FILE_FORMAT => ''' || record.FILE_FORMAT_NAME || '''' ||
+                      '))) ' ||
+                      ' LOCATION = @' || record.STAGE_NAME  || 
+                      ' AUTO_REFRESH = ' || record.AUTO_REFRESH || ' ' ||
+                      ' FILE_FORMAT = (FORMAT_NAME = ' || record.FILE_FORMAT_NAME || ')' || ';';
+
+       INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:source_table_name, CURRENT_TIMESTAMP, :create_external_tbl);
+       EXECUTE IMMEDIATE create_external_tbl;
+       INSERT INTO log (table_name, dw_load_timestamp, log_details) VALUES (:source_table_name, CURRENT_TIMESTAMP, 'External table command executed successfully');
+    END;
+  END FOR;
+
+  
+
+  RETURN 'Data format commands executed successfully';
+END;
+     
+    
+$$;
+
+
+CALL s3_sf_data_load('CONTROL_TABLE_NAME', 'daily', 'BATCH_1');
+
+
+
+
+
+
